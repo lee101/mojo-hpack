@@ -4,6 +4,9 @@ from ._lib import huffman_encode
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 
 
+PYTHON_ENCODE_THRESHOLD = 32
+
+
 class HuffmanEncoder:
     def __init__(self, huffman_code_list, huffman_code_list_lengths):
         self.huffman_code_list = huffman_code_list
@@ -17,7 +20,7 @@ class HuffmanEncoder:
         if not bytes_to_encode:
             return b""
         data = bytes(bytes_to_encode)
-        if self._standard:
+        if self._standard and len(data) > PYTHON_ENCODE_THRESHOLD:
             return huffman_encode(data)
         value = 0
         width = 0

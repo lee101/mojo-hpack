@@ -15,6 +15,7 @@ SRC = os.path.join(ROOT, "src", "hpack.mojo")
 LIB = os.environ.get("MOJO_HPACK_LIB") or os.path.join(ROOT, "dist", "libmojo-hpack.so")
 
 I = ctypes.c_int64
+PARALLEL_MIN_BYTES = 1_048_576
 _SIGNATURES = {
     "mh_huffman_encoded_size": ([I, I, I], I),
     "mh_huffman_encode": ([I, I, I, I, I], I),
@@ -107,11 +108,20 @@ def _build_trie():
 _CODES = (ctypes.c_uint32 * len(REQUEST_CODES))(*REQUEST_CODES)
 _LENGTHS = (ctypes.c_uint8 * len(REQUEST_CODES_LENGTH))(*REQUEST_CODES_LENGTH)
 _LEFT, _RIGHT, _SYMBOLS = _build_trie()
+_bytes_data = ctypes.pythonapi.PyBytes_AsString
+_bytes_data.argtypes = [ctypes.py_object]
+_bytes_data.restype = ctypes.c_void_p
+_new_bytes = ctypes.pythonapi.PyBytes_FromStringAndSize
+_new_bytes.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t]
+_new_bytes.restype = ctypes.py_object
 
 
-def _bytes_address(data: bytes) -> tuple[ctypes.c_char_p, int]:
-    pointer = ctypes.c_char_p(data if data else b"\0")
-    return pointer, ctypes.cast(pointer, ctypes.c_void_p).value
+def _bytes_address(data: bytes) -> int:
+    return _bytes_data(data)
+
+
+def _allocate_bytes(size: int) -> bytes:
+    return _new_bytes(None, size)
 
 
 def huffman_encode(data: bytes) -> bytes:
@@ -119,24 +129,24 @@ def huffman_encode(data: bytes) -> bytes:
         raise TypeError("data must be bytes")
     if not data:
         return b""
-    source, source_address = _bytes_address(data)
+    source_address = _bytes_address(data)
     output_size = lib().mh_huffman_encoded_size(
         source_address, len(data), ctypes.addressof(_LENGTHS)
     )
     if output_size < 0 or output_size > 4 * len(data):
         raise RuntimeError("Mojo Huffman size kernel returned an invalid length")
-    destination = ctypes.create_string_buffer(output_size)
+    destination = _allocate_bytes(output_size)
+    destination_address = _bytes_address(destination)
     written = lib().mh_huffman_encode(
         source_address,
         len(data),
         ctypes.addressof(_CODES),
         ctypes.addressof(_LENGTHS),
-        ctypes.addressof(destination),
+        destination_address,
     )
-    _ = source
     if written != output_size:
         raise RuntimeError("Mojo Huffman encoder returned an invalid length")
-    return ctypes.string_at(ctypes.addressof(destination), written)
+    return destination
 
 
 def huffman_encode_many(values: list[bytes]) -> list[bytes]:
@@ -152,9 +162,10 @@ def huffman_encode_many(values: list[bytes]) -> list[bytes]:
         position += len(value)
     source_offsets[count] = position
     source_data = b"".join(values)
-    source, source_address = _bytes_address(source_data)
+    source_address = _bytes_address(source_data)
     capacity = max(1, (30 * position + 7 * count) // 8)
-    destination = ctypes.create_string_buffer(capacity)
+    destination = _allocate_bytes(capacity)
+    destination_address = _bytes_address(destination)
     result_offsets = (I * (count + 1))()
     written = lib().mh_huffman_encode_batch(
         source_address,
@@ -162,12 +173,13 @@ def huffman_encode_many(values: list[bytes]) -> list[bytes]:
         count,
         ctypes.addressof(_CODES),
         ctypes.addressof(_LENGTHS),
-        ctypes.addressof(destination),
+        destination_address,
         capacity,
         ctypes.addressof(result_offsets),
-        _parallel_runtime_ready() if count >= 256 and position >= 65536 else False,
+        _parallel_runtime_ready()
+        if count >= 256 and position >= PARALLEL_MIN_BYTES
+        else False,
     )
-    _ = source
     if written < 0:
         raise RuntimeError("Huffman batch output capacity was insufficient")
     if written > capacity or result_offsets[count] != written:
@@ -177,7 +189,7 @@ def huffman_encode_many(values: list[bytes]) -> list[bytes]:
         if offset < previous or offset > written:
             raise RuntimeError("Mojo Huffman batch encoder returned invalid offsets")
         previous = offset
-    encoded = ctypes.string_at(ctypes.addressof(destination), written)
+    encoded = destination[:written]
     return [
         encoded[result_offsets[index] : result_offsets[index + 1]]
         for index in range(count)
@@ -189,26 +201,26 @@ def huffman_decode(data: bytes) -> bytes:
         raise TypeError("data must be bytes")
     if not data:
         return b""
-    source, source_address = _bytes_address(data)
+    source_address = _bytes_address(data)
     capacity = (len(data) * 8) // 5 + 1
-    destination = ctypes.create_string_buffer(capacity)
+    destination = _allocate_bytes(capacity)
+    destination_address = _bytes_address(destination)
     written = lib().mh_huffman_decode(
         source_address,
         len(data),
         ctypes.addressof(_LEFT),
         ctypes.addressof(_RIGHT),
         ctypes.addressof(_SYMBOLS),
-        ctypes.addressof(destination),
+        destination_address,
         capacity,
     )
-    _ = source
     if written < 0:
         from .exceptions import HPACKDecodingError
 
         raise HPACKDecodingError("Invalid Huffman string")
     if written > capacity:
         raise RuntimeError("Mojo Huffman decoder returned an invalid length")
-    return ctypes.string_at(ctypes.addressof(destination), written)
+    return destination[:written]
 
 
 def main() -> int:

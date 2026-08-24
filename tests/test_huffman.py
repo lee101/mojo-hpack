@@ -4,7 +4,7 @@ import random
 import pytest
 
 from hpack import HPACKDecodingError
-from hpack._lib import huffman_encode_many
+from hpack._lib import PARALLEL_MIN_BYTES, huffman_encode_many
 from hpack._lib import huffman_decode, huffman_encode, lib
 from hpack.huffman import HuffmanEncoder
 from hpack.huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
@@ -64,6 +64,26 @@ def test_random_binary_matches_upstream(upstream_hpack):
         assert decode_huffman(ours.encode(plain)) == plain
 
 
+@pytest.mark.parametrize("length", [32, 33])
+def test_huffman_encode_python_threshold(upstream_hpack, length):
+    from _upstream_hpack.huffman import HuffmanEncoder as UpstreamEncoder
+    from _upstream_hpack.huffman_constants import REQUEST_CODES as UP_CODES
+    from _upstream_hpack.huffman_constants import REQUEST_CODES_LENGTH as UP_LENGTHS
+
+    plain = bytes(range(length))
+    assert HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH).encode(plain) == (
+        UpstreamEncoder(UP_CODES, UP_LENGTHS).encode(plain)
+    )
+
+
+@pytest.mark.parametrize("plain_length,encoded_length", [(51, 32), (52, 33)])
+def test_huffman_decode_python_threshold(plain_length, encoded_length):
+    plain = b"a" * plain_length
+    encoded = HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH).encode(plain)
+    assert len(encoded) == encoded_length
+    assert decode_huffman(encoded) == plain
+
+
 def test_batched_huffman_simd_tails():
     coder = HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH)
     values = [
@@ -73,13 +93,12 @@ def test_batched_huffman_simd_tails():
     assert huffman_encode_many(values) == [coder.encode(value) for value in values]
 
 
-@pytest.mark.parametrize("count", [255, 256])
-def test_batched_huffman_parallel_threshold(count):
+@pytest.mark.parametrize("size", [PARALLEL_MIN_BYTES - 1, PARALLEL_MIN_BYTES])
+def test_batched_huffman_parallel_threshold(size):
     coder = HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH)
-    values = [
-        bytes((index + offset) & 0xFF for offset in range(257))
-        for index in range(count)
-    ]
+    count = 256
+    width, remainder = divmod(size, count)
+    values = [bytes([index & 0xFF]) * (width + (index < remainder)) for index in range(count)]
     assert huffman_encode_many(values) == [coder.encode(value) for value in values]
 
 

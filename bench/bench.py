@@ -10,6 +10,7 @@ import hpack
 from hpack.huffman import HuffmanEncoder
 from hpack.huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from hpack.huffman_table import decode_huffman
+from hpack._lib import huffman_encode_many
 
 
 def load_upstream():
@@ -56,6 +57,24 @@ def main():
     encoded = mojo_coder.encode(payload)
 
     rows = []
+    short_payload = b"www.example.com"
+    short_encoded = mojo_coder.encode(short_payload)
+    mojo_time, mojo_encoded = best_time(
+        lambda: mojo_coder.encode(short_payload), 20_000
+    )
+    upstream_time, upstream_encoded = best_time(
+        lambda: upstream_coder.encode(short_payload), 20_000
+    )
+    assert mojo_encoded == upstream_encoded
+    rows.append((f"Huffman encode {len(short_payload)} B", mojo_time, upstream_time))
+
+    mojo_time, mojo_decoded = best_time(lambda: decode_huffman(short_encoded), 20_000)
+    upstream_time, upstream_decoded = best_time(
+        lambda: upstream_decode(short_encoded), 20_000
+    )
+    assert mojo_decoded == upstream_decoded == short_payload
+    rows.append((f"Huffman decode {len(short_encoded)} B", mojo_time, upstream_time))
+
     mojo_time, mojo_encoded = best_time(lambda: mojo_coder.encode(payload))
     upstream_time, upstream_encoded = best_time(lambda: upstream_coder.encode(payload))
     assert mojo_encoded == upstream_encoded
@@ -65,6 +84,14 @@ def main():
     upstream_time, upstream_decoded = best_time(lambda: upstream_decode(encoded))
     assert mojo_decoded == upstream_decoded == payload
     rows.append((f"Huffman decode {len(encoded) / 1000:.1f} KB", mojo_time, upstream_time))
+
+    batch_values = [payload[:1024]] * 4_096
+    mojo_time, mojo_batch = best_time(lambda: huffman_encode_many(batch_values), 3)
+    upstream_time, upstream_batch = best_time(
+        lambda: [upstream_coder.encode(value) for value in batch_values], 3
+    )
+    assert mojo_batch == upstream_batch
+    rows.append(("Huffman batch 4.2 MB", mojo_time, upstream_time))
 
     headers = [
         (b":method", b"GET"),
@@ -92,8 +119,11 @@ def main():
     print("| benchmark | mojo-hpack | upstream hpack | speedup |")
     print("| --- | ---: | ---: | ---: |")
     for name, mojo_time, upstream_time in rows:
+        scale = 1_000_000 if max(mojo_time, upstream_time) < 0.001 else 1_000
+        unit = "us" if scale == 1_000_000 else "ms"
         print(
-            f"| {name} | {mojo_time * 1000:.2f} ms | {upstream_time * 1000:.2f} ms | "
+            f"| {name} | {mojo_time * scale:.2f} {unit} | "
+            f"{upstream_time * scale:.2f} {unit} | "
             f"{upstream_time / mojo_time:.2f}x |"
         )
 

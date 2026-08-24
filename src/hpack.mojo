@@ -1,11 +1,14 @@
 """HPACK Huffman kernels exposed through a small C ABI."""
 
+from max.algorithm import parallelize
+from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime U32Ptr = Pointer[UInt32, AnyOrigin[mut=True]]
 comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
 comptime I64Ptr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime PARALLEL_MIN_BYTES = 1_048_576
 
 
 def _encoded_size(src: BPtr, n: Int, lengths: BPtr) -> Int:
@@ -171,9 +174,13 @@ def mh_huffman_encode_batch(
                 dst.unsafe_offset(destination_start),
             )
 
-    encode_range(0)
-    for chunk in range(1, (count + 63) // 64):
-        encode_range(chunk)
+    var chunks = (count + 63) // 64
+    if use_parallel != 0 and count >= 256 and source_size >= PARALLEL_MIN_BYTES:
+        initialize_runtime()
+        parallelize[encode_range](chunks, min(chunks, 16))
+    else:
+        for chunk in range(chunks):
+            encode_range(chunk)
     return total
 
 

@@ -9,7 +9,8 @@ without changing imports.
 The implemented scope is RFC 7541 header-block encoding and decoding: static and
 dynamic tables, table-size updates, never-indexed fields, header-list size limits, raw
 and Unicode output, integer representations, and the RFC Appendix B Huffman code.
-Huffman encoding and decoding run in compiled Mojo. Tests compare exact wire bytes and
+Large Huffman encoding and decoding run in compiled Mojo; tiny fields use generated
+Python fast paths to avoid FFI launch overhead. Tests compare exact wire bytes and
 stateful behavior with upstream `hpack` 4.2.0 and exercise the published RFC request
 and Huffman vectors.
 
@@ -77,13 +78,17 @@ table are not compatibility targets.
 ## Benchmarks
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz with Python
-3.13.14. Times are the best of five runs on identical input (three for the full encoder).
+3.13.14. Times are the best of repeated runs on identical input; the short-field rows
+use 20,000 repetitions and the batch and full-encoder rows use three.
 
 | benchmark | mojo-hpack | upstream hpack | speedup |
 | --- | ---: | ---: | ---: |
-| Huffman encode 61.4 KB | 0.27 ms | 579.30 ms | 2130.80x |
-| Huffman decode 52.5 KB | 1.84 ms | 16.85 ms | 9.13x |
-| Encoder 2,004 headers | 34.80 ms | 126.57 ms | 3.64x |
+| Huffman encode 15 B | 2.14 us | 3.41 us | 1.60x |
+| Huffman decode 12 B | 1.70 us | 3.69 us | 2.18x |
+| Huffman encode 61.4 KB | 0.36 ms | 576.27 ms | 1618.76x |
+| Huffman decode 52.5 KB | 1.81 ms | 17.00 ms | 9.37x |
+| Huffman batch 4.2 MB | 13.60 ms | 1769.67 ms | 130.09x |
+| Encoder 2,004 headers | 13.74 ms | 89.30 ms | 6.50x |
 
 The unusually large encoding ratio is real: upstream builds one ever-growing Python
 integer for the complete bitstream, so its cost grows steeply with long values. Typical
@@ -91,23 +96,26 @@ HTTP headers are short, where fixed ctypes call overhead reduces the advantage. 
 full-encoder row uses 2,000 distinct metadata headers and includes Python table work and
 all FFI crossings.
 
-No GPU path is provided. Large independent header fields use thresholded CPU
-parallelism.
+No GPU path is provided. Huffman coding has low arithmetic intensity and serial,
+data-dependent bitstream state, so device transfer and launch overhead would dominate.
+Large independent header fields use thresholded CPU parallelism instead.
 
 ## How it works
 
 Python owns header state, immutable input bytes, result buffers, the canonical code
-arrays, and a
-compact binary decode trie. ctypes passes their addresses as `Int` values across the C
-ABI. The Mojo functions reconstruct `UnsafePointer` values with
-`AnyOrigin[mut=True]`, stream codes through a bounded 64-bit accumulator, and write
-directly into caller-owned contiguous byte buffers. Large header lists concatenate
-source fields once, make one batched FFI call, and encode 64-field chunks in parallel
-above a 256-field and 64 KiB threshold. The decoder traverses contiguous `Int32` child
-and symbol arrays, rejects EOS symbols and invalid padding, and performs no allocation.
+arrays, and a compact binary decode trie. ctypes passes their addresses as `Int` values
+across the C ABI. The Mojo functions reconstruct `Pointer` values with
+`AnyOrigin[mut=True]`, stream
+codes through a bounded 64-bit accumulator, and write directly into caller-owned
+contiguous byte buffers. Large header lists concatenate source fields once, make one
+batched FFI call, and encode 64-field chunks in parallel above a 256-field and 1 MiB
+threshold. The decoder traverses contiguous `Int32` child and symbol arrays, rejects EOS
+symbols and invalid padding, and performs no allocation.
 Nothing crosses the boundary as a Python object. The bridge rejects other buffer types,
-validates addresses and signed lengths before pointer construction, keeps ctypes owners
-alive for each call, and checks returned lengths and batch offsets before reading output.
+validates addresses and signed lengths before pointer construction, obtains source and
+destination byte-buffer addresses without copying, and checks returned lengths and batch
+offsets before reading output. Inputs up to 32 bytes avoid FFI: encoding uses a bounded
+Python integer and decoding uses a byte automaton generated from the canonical trie.
 
 `MOJO_HPACK_LIB` can point at a prebuilt shared library when compilation at import time
 is undesirable.
