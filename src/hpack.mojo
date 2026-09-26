@@ -1,15 +1,12 @@
 """HPACK Huffman kernels exposed through a small C ABI."""
 
-from max.algorithm import parallelize
-from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime U32Ptr = Pointer[UInt32, AnyOrigin[mut=True]]
 comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
 comptime I64Ptr = Pointer[Int64, AnyOrigin[mut=True]]
-comptime PARALLEL_MIN_BYTES = 1_048_576
-
+comptime ENCODE_CHUNK = 64
 
 def _encoded_size(src: BPtr, n: Int, lengths: BPtr) -> Int:
     comptime W = simd_width_of[DType.float64]()
@@ -154,12 +151,12 @@ def mh_huffman_encode_batch(
         return -1
     if total != 0 and dst_addr == 0:
         return -3
-
-    @__parameter
-    def encode_range(chunk: Int):
-        comptime chunk_size = 64
-        var first = chunk * chunk_size
-        var end = min(first + chunk_size, count)
+    # Huffman encoding is a serial bit-packing loop over table lookups, so the
+    # chunks are walked in order; every symbol writes a disjoint output range.
+    var chunks = (count + ENCODE_CHUNK - 1) // ENCODE_CHUNK
+    for chunk in range(chunks):
+        var first = chunk * ENCODE_CHUNK
+        var end = min(first + ENCODE_CHUNK, count)
         for index in range(first, end):
             var source_start = Int(source_offsets[unsafe_offset=index])
             var source_size = (
@@ -173,14 +170,6 @@ def mh_huffman_encode_batch(
                 lengths,
                 dst.unsafe_offset(destination_start),
             )
-
-    var chunks = (count + 63) // 64
-    if use_parallel != 0 and count >= 256 and source_size >= PARALLEL_MIN_BYTES:
-        initialize_runtime()
-        parallelize[encode_range](chunks, min(chunks, 16))
-    else:
-        for chunk in range(chunks):
-            encode_range(chunk)
     return total
 
 
