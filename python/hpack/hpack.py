@@ -145,7 +145,8 @@ class Encoder:
 
     def add(self, to_add, sensitive, huffman=False, *, _encoded=None):
         name, value = to_add
-        indexbit = INDEX_NEVER if sensitive else INDEX_INCREMENTAL
+        # Upstream Encoder.add line 318.
+        indexbit = INDEX_INCREMENTAL if not sensitive else INDEX_NEVER
         match = self.header_table.search(name, value)
         if match is None:
             encoded = self._encode_literal(
