@@ -80,23 +80,23 @@ table are not compatibility targets.
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz with Python
 3.13.14. Times are the best of repeated runs on identical input; the short-field rows
 use 20,000 repetitions and the batch and full-encoder rows use three. The host is shared
-with other workloads, so these are medians of three full bench runs with the observed
-spread noted where it is material.
+with other workloads, so these are medians of five full bench runs and the observed
+spread is noted where it is material.
 
 | benchmark | mojo-hpack | upstream hpack | speedup |
 | --- | ---: | ---: | ---: |
 | Huffman encode 15 B | 2.30 us | 3.65 us | 1.59x |
-| Huffman decode 12 B | 1.89 us | 3.95 us | 2.09x |
+| Huffman decode 12 B | 1.72 us | 3.76 us | 2.19x |
 | Huffman encode 61.4 KB | 0.22 ms | 578.91 ms | 2622.42x |
 | Huffman decode 52.5 KB | 1.43 ms | 17.19 ms | 11.89x |
-| Huffman batch 4.2 MB | 16.73 ms | 1801.56 ms | 107.70x |
-| Encoder 2,004 headers | 13.03 ms | 88.92 ms | 6.76x |
+| Huffman batch 4.2 MB | 16.43 ms | 1782.67 ms | 108.49x |
+| Encoder 2,004 headers | 13.21 ms | 91.83 ms | 6.95x |
 
-The encoder row spread across the three runs (12.89 to 28.59 ms) tracks host load, not
+The encoder row spread across the five verification runs (12.67 to 14.76 ms) tracks host load, not
 the code; it stays on the serial path either way. To separate the parallelism change
-from that noise, the batch and encoder rows were also run back to back with the
-parallel threshold disabled: batch 4.2 MB went from 23.73 ms to 16.67 ms (1.42x) and
-the 2,004-header encoder row was flat at 13.59 against 13.03 ms.
+from that noise, the batch row was also run back to back with the parallel path forced
+off: batch 4.2 MB went from 28.02 ms to 19.95 ms (1.40x) and the 2,004-header encoder
+row was flat at 17.00 ms on both paths.
 
 The unusually large encoding ratio is real: upstream builds one ever-growing Python
 integer for the complete bitstream, so its cost grows steeply with long values. Typical
