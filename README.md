@@ -104,8 +104,121 @@ HTTP headers are short, where fixed ctypes call overhead reduces the advantage. 
 full-encoder row uses 2,000 distinct metadata headers and includes Python table work and
 all FFI crossings.
 
-No GPU path is provided. Huffman coding has low arithmetic intensity and serial,
-data-dependent bitstream state, so device transfer and launch overhead would dominate.
+CPU only: memory-bound. No GPU path is provided; see [GPU](#gpu) for the measurements
+that decided that.
+
+## GPU
+
+No GPU path is implemented. Both Huffman kernels are below the arithmetic-intensity gate,
+so per the phase rules this is a **CPU only: memory-bound** outcome and no device code was
+added.
+
+The gate was checked before any GPU work:
+
+- The size gate references `bench/analysis.md`. That file does not exist in this repository
+  (it is not in `HEAD` or any commit; only its generator `bench/.analysis-tmp/analyze.py`
+  is tracked). The intensity figures below were therefore measured directly for this
+  decision instead of being read from it.
+- `nvidia-smi --query-gpu=memory.free --format=csv,noheader` reported **4309 MiB free** on
+  an RTX 5090 (32,607 MiB total, 71% utilisation) on 2026-11-10, above the 4000 MiB floor,
+  so the phase was evaluated rather than skipped.
+- `DeviceContext` from `max.gpu.host` and `block_idx`/`thread_idx` from `max.gpu` do work on
+  this toolchain: a device-query probe and a streaming kernel both ran on the RTX 5090.
+  No allocation here would approach 2 GB.
+
+**Arithmetic intensity.** Measured on the Mojo kernels themselves (the FFI-call cost
+subtracted), Intel Xeon E5-2697 v4 host, RTX 5090 device:
+
+| kernel | traffic per call | serial operations | intensity | clean CPU cost |
+| --- | --- | --- | --- | --- |
+| `mh_huffman_encode` | read `n`, write ~1.03`n` | one shift+or+store per emitted bit | ~15 bit-ops per input byte, 1 pass | 0.022 ns per byte at 1 MiB |
+| `mh_huffman_decode` | read `n`, write ~0.98`n` | one trie step per input bit | ~8 trie steps per input byte, 1 pass | 0.261 ns per encoded byte at 1 MiB |
+
+Both are far under the ~2 flops per byte threshold: a few integer ops per byte, done once,
+with no reuse. Each kernel is one streaming pass: the encode side accumulates a 64-bit word
+and stores every full byte, the decode side follows a compile-time trie one bit at a time.
+There is no tile to promote into shared memory, so a device port would be a bandwidth copy
+wrapped around a serial, data-dependent bitstream state, which is exactly the shape that
+cannot amortise a transfer.
+
+**Numbers that would have had to be beaten.** Measured on the same host and device with a
+one-launch-per-call streaming kernel and a single copy-in/copy-out:
+
+| transfer | H2D | D2H | round trip | effective bandwidth |
+| --- | ---: | ---: | ---: | ---: |
+| 15 B | 5.96 us | 7.47 us | 13.42 us | — |
+| 4 KiB | 7.41 us | 8.31 us | 15.71 us | — |
+| 60 KiB | 25.83 us | 23.71 us | 49.53 us | — |
+| 1 MiB | 198.78 us | 271.96 us | 470.74 us | 5 to 10 GB/s over PCIe |
+
+The empty launch plus `synchronize()` floor is **6.10 us best of 200, 10.03 us mean**,
+independent of payload. Device-side streaming bandwidth on the same kernel is 1.5 to 2.4 TB/s,
+so the device is not the limit; PCIe and launch are.
+
+**Comparison at real caller sizes.** Single-field through `huffman_encode`/`huffman_decode`,
+CPU kernel time against the measured transfer plus launch floor. Ratios are CPU divided by
+floor, so above 1.0 the GPU could break even:
+
+| input | encoded | CPU encode | CPU decode | floor (in+out+launch) | enc CPU/floor | dec CPU/floor |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 15 B | 11 B | under 0.1 us | under 0.1 us | 20.9 us | under 0.005 | under 0.005 |
+| 1 KiB | 872 B | under 0.1 us | 0.4 us | 23.1 us | under 0.005 | 0.019 |
+| 4 KiB | 3,501 B | under 0.1 us | 3.9 us | 23.1 us | under 0.005 | 0.17 |
+| 16 KiB | 14,008 B | 6.6 us | 60.2 us | 57.0 us | 0.115 | 1.06 |
+| 60 KiB | 52,544 B | 55.3 us | 672 us | 57.0 us | 0.970 | 11.8 |
+| 256 KiB | 224,184 B | 1,075 us | 11,658 us | 478 us | 2.25 | 24.4 |
+| 1 MiB | 896,749 B | 23,172 us | 233,961 us | 478 us | 48.5 | 489 |
+
+`under 0.1 us` means the kernel is too fast to resolve from ctypes call overhead at that
+size. Columns are CPU kernel time and the measured floor for the same data, then CPU divided
+by floor: below 1.0 the CPU kernel is cheaper than getting the bytes to the device and back,
+so a GPU cannot win however fast its kernel is.
+
+Both kernels are beaten by their own transfer across the whole size range that `hpack`
+actually serves. At 15 B to 4 KiB, the field sizes this library sees most, the CPU finishes
+the kernel in under a microsecond while the launch alone costs 6.1 us. Above that the encoder
+does eventually cost more than the transfer (2.25x at 256 KiB, 48.5x at 1 MiB), but that is
+PCIe being slow rather than the kernel having compute to amortise: the encoder is a
+one-word-per-byte dependency chain, the worst possible shape for a GPU, and each row is
+measured on the CPU so it does not claim what a device kernel would do. The two rows where a
+GPU could plausibly compete are 256 KiB and 1 MiB inputs, which are not header fields this
+library is given.
+
+The decode kernel is the slower of the two and the only row where a device kernel has any
+headroom at all: above 16 KiB the transfer no longer decides, and at 1 MiB the CPU spends
+234 ms against a 0.48 ms floor. A device decoder would still have to beat a kernel that runs
+at ~0.26 ns per encoded byte, reproduce the trie walk's mid-stream failure returns (`-1`
+invalid padding, `-2` short output), and pay the round trip. Real header fields are tens to
+hundreds of bytes, `PYTHON_ENCODE_THRESHOLD` is 32 B, and the whole Encoder/Decoder path for
+2,004 fields is 13 ms. The GPU decode win would need fields of hundreds of kilobytes that
+this library is never handed, so it was not written.
+
+The arithmetic-intensity gate is why this ends at "CPU only: memory-bound" rather than
+"write a decoder". Both kernels move every byte once and reuse nothing (encode: one
+shift+or+store per emitted bit; decode: one trie step per bit), which is a few integer ops
+per byte against roughly 2 bytes of traffic, so there is no tile to promote into shared
+memory and no compute to hide the transfer behind.
+
+Shipping a decode-only path was considered and rejected. It would win only for payloads of
+hundreds of kilobytes, which is not how `hpack` is called; it would add a device dependency
+and a round trip in the decode path on a shared GPU, and it would have to carry the current
+mid-stream failure returns (`-1` for invalid padding, `-2` for short output) across the FFI
+boundary. Nothing was reverted because nothing was shipped: the CPU path, SIMD tails, and
+the `parallelize` batch path are unchanged, and no test skips on this host because no test
+needs a device.
+
+The probes that produced the numbers are kept under `bench/.gpu-tmp/` so the figures can be
+rechecked. They need a CUDA device:
+
+```bash
+pixi run mojo run bench/.gpu-tmp/bw.mojo           # device streaming bandwidth
+pixi run mojo run bench/.gpu-tmp/launchfloor.mojo # launch + synchronize floor
+pixi run mojo run bench/.gpu-tmp/floor.mojo       # copy in / copy out per size
+flock /tmp/mojo-bench.lock pixi run python bench/.gpu-tmp/enc_sizes.py  # encode kernel us
+flock /tmp/mojo-bench.lock pixi run python bench/.gpu-tmp/dec_sizes.py  # decode kernel us
+```
+
+`.gpu-tmp/` is not on the import path and is not part of the build.
 
 ## Parallelism
 
