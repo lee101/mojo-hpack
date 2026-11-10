@@ -37,16 +37,14 @@ def _encode_to(
             codes[unsafe_offset=symbol]
         )
         bit_count += width
+        # Every emission reads only the low `bit_count` bits, and those are the
+        # only ones left live, so no mask has to clear the bits above them.
         while bit_count >= 8:
             bit_count -= 8
             dst[unsafe_offset=dst_index] = UInt8(
                 (accumulator >> UInt64(bit_count)) & 255
             )
             dst_index += 1
-        if bit_count == 0:
-            accumulator = 0
-        else:
-            accumulator &= (UInt64(1) << UInt64(bit_count)) - 1
 
     if bit_count != 0:
         var padding = 8 - bit_count
@@ -208,18 +206,17 @@ def mh_huffman_decode(
     var node = 0
     var dst_index = 0
     var trailing_bits = 0
-    var trailing_ones = True
 
     for i in range(n):
         var byte = Int(src[unsafe_offset=i])
+        # The bit depends on the input, so branch on it and the predictor loses
+        # about half the time; select the child arithmetically instead.
         for shift in range(7, -1, -1):
-            var bit = (byte >> shift) & 1
+            var mask = Int32((byte >> shift) & 1) - 1
             trailing_bits += 1
-            if bit == 0:
-                trailing_ones = False
-                node = Int(left[unsafe_offset=node])
-            else:
-                node = Int(right[unsafe_offset=node])
+            var to_left = left[unsafe_offset=node]
+            var to_right = right[unsafe_offset=node]
+            node = Int((to_left & mask) | (to_right & ~mask))
             if node < 0:
                 return -1
             var symbol = Int(symbols[unsafe_offset=node])
@@ -232,8 +229,18 @@ def mh_huffman_decode(
                 dst_index += 1
                 node = 0
                 trailing_bits = 0
-                trailing_ones = True
 
-    if node != 0 and (trailing_bits > 7 or not trailing_ones):
-        return -1
+    # Valid padding is at most 7 trailing bits, all ones. Following right edges
+    # from the root for `trailing_bits` steps and landing on `node` says exactly
+    # that, so the per-bit `trailing_ones` flag is not needed.
+    if node != 0:
+        if trailing_bits > 7:
+            return -1
+        var probe = 0
+        for _ in range(trailing_bits):
+            probe = Int(right[unsafe_offset=probe])
+            if probe < 0:
+                return -1
+        if probe != node:
+            return -1
     return dst_index
