@@ -15,7 +15,11 @@ SRC = os.path.join(ROOT, "src", "hpack.mojo")
 LIB = os.environ.get("MOJO_HPACK_LIB") or os.path.join(ROOT, "dist", "libmojo-hpack.so")
 
 I = ctypes.c_int64
-PARALLEL_MIN_BYTES = 1_048_576
+# Crossover measured on the 72-core Xeon host: four workers lose to serial up to
+# 1 MiB and only tie it there, so the serial path is kept below 2 MiB.
+PARALLEL_MIN_BYTES = 2_097_152
+# Worker cap: the host is shared, and the batch curve flattens at four workers.
+PARALLEL_MAX_WORKERS = 4
 _SIGNATURES = {
     "mh_huffman_encoded_size": ([I, I, I], I),
     "mh_huffman_encode": ([I, I, I, I, I], I),
@@ -149,7 +153,7 @@ def huffman_encode(data: bytes) -> bytes:
     return destination
 
 
-def huffman_encode_many(values: list[bytes]) -> list[bytes]:
+def huffman_encode_many(values: list[bytes], workers: int | None = None) -> list[bytes]:
     if type(values) is not list or any(type(value) is not bytes for value in values):
         raise TypeError("values must be a list of bytes")
     count = len(values)
@@ -161,6 +165,16 @@ def huffman_encode_many(values: list[bytes]) -> list[bytes]:
         source_offsets[index] = position
         position += len(value)
     source_offsets[count] = position
+    if workers is None:
+        workers = (
+            PARALLEL_MAX_WORKERS
+            if count >= 256
+            and position >= PARALLEL_MIN_BYTES
+            and _parallel_runtime_ready()
+            else 1
+        )
+    else:
+        workers = min(max(int(workers), 1), PARALLEL_MAX_WORKERS)
     source_data = b"".join(values)
     source_address = _bytes_address(source_data)
     capacity = max(1, (30 * position + 7 * count) // 8)
@@ -176,9 +190,7 @@ def huffman_encode_many(values: list[bytes]) -> list[bytes]:
         destination_address,
         capacity,
         ctypes.addressof(result_offsets),
-        _parallel_runtime_ready()
-        if count >= 256 and position >= PARALLEL_MIN_BYTES
-        else False,
+        workers,
     )
     if written < 0:
         raise RuntimeError("Huffman batch output capacity was insufficient")

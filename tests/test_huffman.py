@@ -4,7 +4,7 @@ import random
 import pytest
 
 from hpack import HPACKDecodingError
-from hpack._lib import PARALLEL_MIN_BYTES, huffman_encode_many
+from hpack._lib import PARALLEL_MAX_WORKERS, PARALLEL_MIN_BYTES, huffman_encode_many
 from hpack._lib import huffman_decode, huffman_encode, lib
 from hpack.huffman import HuffmanEncoder
 from hpack.huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
@@ -100,6 +100,28 @@ def test_batched_huffman_parallel_threshold(size):
     width, remainder = divmod(size, count)
     values = [bytes([index & 0xFF]) * (width + (index < remainder)) for index in range(count)]
     assert huffman_encode_many(values) == [coder.encode(value) for value in values]
+
+
+@pytest.mark.parametrize("field_bytes", [3, 60, 1024])
+def test_batched_huffman_serial_matches_parallel(field_bytes):
+    """Forcing the parallel path must not change a single output byte."""
+    rng = random.Random(23)
+    count = 4_000
+    values = [rng.randbytes(field_bytes) for _ in range(count)]
+    serial = huffman_encode_many(values, workers=1)
+    for workers in range(2, PARALLEL_MAX_WORKERS + 1):
+        parallel = huffman_encode_many(values, workers=workers)
+        assert parallel == serial
+    coder = HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH)
+    assert serial == [coder.encode(value) for value in values]
+
+
+def test_batched_huffman_parallel_short_field_count_straddles_chunk():
+    """Chunk-boundary counts must stay exact on the parallel path."""
+    for count in (63, 64, 65, 127, 128, 129, 1_000):
+        values = [bytes([index & 0xFF]) * 7 for index in range(count)]
+        serial = huffman_encode_many(values, workers=1)
+        assert huffman_encode_many(values, workers=PARALLEL_MAX_WORKERS) == serial
 
 
 def test_memoryview_decode():

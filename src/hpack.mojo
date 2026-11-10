@@ -1,5 +1,6 @@
 """HPACK Huffman kernels exposed through a small C ABI."""
 
+from max.algorithm import parallelize
 from std.sys.info import simd_width_of
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
@@ -7,6 +8,9 @@ comptime U32Ptr = Pointer[UInt32, AnyOrigin[mut=True]]
 comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
 comptime I64Ptr = Pointer[Int64, AnyOrigin[mut=True]]
 comptime ENCODE_CHUNK = 64
+# Worker cap: the host is shared. The README's curve shows four workers is where
+# a batch above the bridge's dispatch threshold stops gaining usefully.
+comptime MAX_WORKERS = 4
 
 def _encoded_size(src: BPtr, n: Int, lengths: BPtr) -> Int:
     comptime W = simd_width_of[DType.float64]()
@@ -149,10 +153,13 @@ def mh_huffman_encode_batch(
         return -1
     if total != 0 and dst_addr == 0:
         return -3
-    # Huffman encoding is a serial bit-packing loop over table lookups, so the
-    # chunks are walked in order; every symbol writes a disjoint output range.
+    # Huffman encoding is a serial bit-packing loop *within* one field, but every
+    # field writes a disjoint range of `dst`, so independent fields can run in
+    # parallel. Each chunk is rebuilt here rather than captured, so nothing fuzzy
+    # crosses into the worker.
     var chunks = (count + ENCODE_CHUNK - 1) // ENCODE_CHUNK
-    for chunk in range(chunks):
+
+    def encode_chunk(chunk: Int) {imm}:
         var first = chunk * ENCODE_CHUNK
         var end = min(first + ENCODE_CHUNK, count)
         for index in range(first, end):
@@ -168,6 +175,16 @@ def mh_huffman_encode_batch(
                 lengths,
                 dst.unsafe_offset(destination_start),
             )
+
+    # `use_parallel` carries the worker count: 1 is serial, 2 or more asks for
+    # that many workers. The C bridge sends 1 below its size threshold and
+    # MAX_WORKERS above it; higher values exist so the benchmark can measure the
+    # scaling curve on the same input.
+    if use_parallel >= 2 and chunks > 1:
+        parallelize(encode_chunk, chunks, min(chunks, min(use_parallel, MAX_WORKERS)))
+    else:
+        for chunk in range(chunks):
+            encode_chunk(chunk)
     return total
 
 
